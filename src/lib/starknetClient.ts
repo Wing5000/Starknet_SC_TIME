@@ -5,11 +5,174 @@ const DEFAULT_MAX_TRACE_LOOKUPS = 200
 const MAX_RPC_RETRIES = 4
 const BASE_RETRY_DELAY_MS = 500
 const MAX_RETRY_DELAY_MS = 10_000
+const DEFAULT_RPC_REQUESTS_PER_SECOND = 3
+const DEFAULT_RPC_MAX_CONCURRENCY = 2
 
 type RetryLogEntry = { level: ActivityLogLevel; message: string }
 type RetryLogger = (entry: RetryLogEntry) => void
 
+type RateLimiterLogger = RetryLogger
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+interface RateLimiterTask {
+  factory: () => Promise<unknown>
+  resolve: (value: unknown) => void
+  reject: (reason: unknown) => void
+  method: string
+  log?: RateLimiterLogger
+}
+
+interface RateLimiterOptions {
+  requestsPerSecond: number
+  maxConcurrency: number
+}
+
+class RpcRateLimiter {
+  private readonly requestsPerSecond: number
+
+  private readonly maxConcurrency: number
+
+  private readonly queue: RateLimiterTask[] = []
+
+  private active = 0
+
+  private tokens: number
+
+  private lastRefill = Date.now()
+
+  private timer?: ReturnType<typeof setTimeout>
+
+  constructor(options: RateLimiterOptions) {
+    this.requestsPerSecond = Math.max(0.1, options.requestsPerSecond)
+    this.maxConcurrency = Math.max(1, Math.floor(options.maxConcurrency))
+    this.tokens = this.requestsPerSecond
+  }
+
+  get config(): RateLimiterOptions {
+    return { requestsPerSecond: this.requestsPerSecond, maxConcurrency: this.maxConcurrency }
+  }
+
+  schedule<T>(factory: () => Promise<T>, metadata: { method: string; log?: RateLimiterLogger }): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const task: RateLimiterTask = {
+        factory: () => factory(),
+        resolve: (value) => {
+          resolve(value as T)
+        },
+        reject,
+        method: metadata.method,
+        log: metadata.log
+      }
+
+      this.refillTokens()
+
+      if (this.canRunImmediately()) {
+        this.runTask(task)
+        return
+      }
+
+      this.queue.push(task)
+
+      const reasons: string[] = []
+      if (this.active >= this.maxConcurrency) reasons.push('concurrency')
+      if (this.tokens < 1) reasons.push('rate')
+      const reasonText = reasons.length > 0 ? reasons.join(' & ') : 'pending'
+      const waitEstimate = this.tokens < 1 ? Math.ceil(((1 - this.tokens) / this.requestsPerSecond) * 1000) : 0
+      const waitLabel = waitEstimate > 0 ? ` (~${waitEstimate}ms)` : ''
+
+      metadata.log?.({
+        level: 'warn',
+        message: `[limiter] Throttling ${metadata.method} (${reasonText}). Queue length: ${this.queue.length}${waitLabel}`
+      })
+
+      this.ensureTimer()
+    })
+  }
+
+  private canRunImmediately(): boolean {
+    return this.active < this.maxConcurrency && this.tokens >= 1
+  }
+
+  private runTask(task: RateLimiterTask): void {
+    this.active += 1
+    this.tokens = Math.max(0, this.tokens - 1)
+
+    const finalize = () => {
+      this.active = Math.max(0, this.active - 1)
+      this.processQueue()
+    }
+
+    Promise.resolve()
+      .then(() => task.factory())
+      .then(
+        (value) => {
+          task.resolve(value)
+        },
+        (error) => {
+          task.reject(error)
+        }
+      )
+      .finally(finalize)
+  }
+
+  private processQueue(): void {
+    this.refillTokens()
+
+    while (this.canRunImmediately() && this.queue.length > 0) {
+      const next = this.queue.shift()!
+      this.runTask(next)
+    }
+
+    this.ensureTimer()
+  }
+
+  private ensureTimer(): void {
+    if (this.queue.length === 0) {
+      if (this.timer) {
+        clearTimeout(this.timer)
+        this.timer = undefined
+      }
+      return
+    }
+
+    if (this.canRunImmediately()) {
+      if (this.timer) {
+        clearTimeout(this.timer)
+        this.timer = undefined
+      }
+      this.processQueue()
+      return
+    }
+
+    if (this.tokens >= 1 || this.timer) {
+      return
+    }
+
+    const waitMs = this.timeUntilNextToken()
+    this.timer = setTimeout(() => {
+      this.timer = undefined
+      this.processQueue()
+    }, waitMs)
+  }
+
+  private timeUntilNextToken(): number {
+    if (this.tokens >= 1) return 0
+    const deficit = 1 - this.tokens
+    const waitMs = Math.ceil((deficit / this.requestsPerSecond) * 1000)
+    return Math.max(10, waitMs)
+  }
+
+  private refillTokens(): void {
+    const now = Date.now()
+    const elapsedMs = now - this.lastRefill
+    if (elapsedMs <= 0) return
+
+    const tokensToAdd = (elapsedMs / 1000) * this.requestsPerSecond
+    this.tokens = Math.min(this.requestsPerSecond, this.tokens + tokensToAdd)
+    this.lastRefill = now
+  }
+}
 
 const parseRetryAfterHeader = (value: unknown): number | undefined => {
   if (value == null) return undefined
@@ -84,6 +247,32 @@ async function callRpcWithRetry<T>(factory: () => Promise<T>, options: RetryOpti
 
   throw new Error(`[${method}] RPC retry exhausted`)
 }
+
+const parsePositiveNumber = (value: unknown, fallback: number, minimum = 0.0001): number => {
+  const parsed = Number(value)
+  if (Number.isFinite(parsed) && parsed >= minimum) {
+    return parsed
+  }
+  return fallback
+}
+
+const env = (import.meta as any)?.env ?? {}
+
+export const RPC_REQUESTS_PER_SECOND = parsePositiveNumber(
+  env?.VITE_RPC_REQUESTS_PER_SECOND,
+  DEFAULT_RPC_REQUESTS_PER_SECOND,
+  0.0001
+)
+
+export const RPC_MAX_CONCURRENCY = Math.max(
+  1,
+  Math.floor(parsePositiveNumber(env?.VITE_RPC_MAX_CONCURRENCY, DEFAULT_RPC_MAX_CONCURRENCY, 1))
+)
+
+const rpcRateLimiter = new RpcRateLimiter({
+  requestsPerSecond: RPC_REQUESTS_PER_SECOND,
+  maxConcurrency: RPC_MAX_CONCURRENCY
+})
 const configuredLookupLimit = Number(
   (import.meta as any)?.env?.VITE_MAX_TRACE_LOOKUPS ?? DEFAULT_MAX_TRACE_LOOKUPS
 )
@@ -111,7 +300,13 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const addressLower = p.address.toLowerCase()
   const noopLog: RetryLogger = () => {}
   const log = p.log ?? noopLog
-  const callWithRetry = <T>(factory: () => Promise<T>, method: string) => callRpcWithRetry(factory, { method, log })
+  const callWithLimiter = <T>(factory: () => Promise<T>, method: string) =>
+    rpcRateLimiter.schedule(() => callRpcWithRetry(factory, { method, log }), { method, log })
+
+  log({
+    level: 'info',
+    message: `[limiter] RPC limiter configured: ${RPC_REQUESTS_PER_SECOND} req/s, concurrency ${RPC_MAX_CONCURRENCY}`
+  })
 
   const decodeSelector = (value?: string): string | undefined => {
     if (!value) return undefined
@@ -152,13 +347,13 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const getBlockTimestamp = async (blockNumber?: number): Promise<number> => {
     if (blockNumber == null) return Math.floor(Date.now() / 1000)
     if (blockTimestampCache.has(blockNumber)) return blockTimestampCache.get(blockNumber)!
-    const block = await callWithRetry(() => provider.getBlockWithTxHashes(blockNumber), 'getBlockWithTxHashes')
+    const block = await callWithLimiter(() => provider.getBlockWithTxHashes(blockNumber), 'getBlockWithTxHashes')
     const timestamp = Number((block as any).timestamp ?? Math.floor(Date.now() / 1000))
     blockTimestampCache.set(blockNumber, timestamp)
     return timestamp
   }
 
-  const latestBlock = await callWithRetry(() => provider.getBlockWithTxHashes('latest' as any), 'getBlockWithTxHashes')
+  const latestBlock = await callWithLimiter(() => provider.getBlockWithTxHashes('latest' as any), 'getBlockWithTxHashes')
   const latestBlockNumber = Number((latestBlock as any).block_number ?? 0)
   const latestTimestamp = Number((latestBlock as any).timestamp ?? Math.floor(Date.now() / 1000))
   blockTimestampCache.set(latestBlockNumber, latestTimestamp)
@@ -300,7 +495,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   }
 
   do {
-    const { events, continuation_token } = await callWithRetry(() => provider.getEvents({
+    const { events, continuation_token } = await callWithLimiter(() => provider.getEvents({
       address: p.address,
       chunk_size: chunkSize,
       continuation_token: continuation,
@@ -316,12 +511,12 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       if (!txHash || seenTx.has(txHash)) continue
 
       try {
-        const receipt = await callWithRetry(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
+        const receipt = await callWithLimiter(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
         if (!receipt) continue
 
         const timestamp = await getBlockTimestamp(receipt.block_number ?? (event as any).block_number)
 
-        const tx = await callWithRetry(() => provider.getTransactionByHash(txHash), 'getTransactionByHash') as any
+        const tx = await callWithLimiter(() => provider.getTransactionByHash(txHash), 'getTransactionByHash') as any
         const eventForContract = Array.isArray(receipt.events)
           ? receipt.events.find((e: any) => String(e.from_address || '').toLowerCase() === addressLower)
           : undefined
@@ -380,7 +575,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     let block: any
 
     try {
-      block = await callWithRetry(() => provider.getBlockWithTxs(blockNumber), 'getBlockWithTxs')
+      block = await callWithLimiter(() => provider.getBlockWithTxs(blockNumber), 'getBlockWithTxs')
       remainingTraceLookups -= 1
     } catch {
       continue
@@ -415,7 +610,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       if (!txHash) continue
 
       try {
-        const trace = await callWithRetry(() => provider.getTransactionTrace(txHash), 'getTransactionTrace')
+        const trace = await callWithLimiter(() => provider.getTransactionTrace(txHash), 'getTransactionTrace')
         remainingTraceLookups -= 1
         const invocation = extractInvocationFromTrace(trace)
         if (!invocation) continue
@@ -423,7 +618,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
         const contractAddress = String(invocation.contract_address || '').toLowerCase()
         if (contractAddress !== addressLower) continue
 
-        const receipt = await callWithRetry(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
+        const receipt = await callWithLimiter(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
         if (!receipt) continue
 
         const timestamp = await getBlockTimestamp(receipt.block_number ?? blockNumber)
