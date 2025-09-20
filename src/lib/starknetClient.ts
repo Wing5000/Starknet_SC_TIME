@@ -17,9 +17,17 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const rows: TxRow[] = []
   const latest = await provider.getBlockNumber()
   const lookback = 400
+  const fromTs = Number.isFinite(p.from) ? p.from : 0
+  const toTs = Number.isFinite(p.to) ? p.to : Number.MAX_SAFE_INTEGER
+  const nowSeconds = Math.floor(Date.now() / 1000)
 
   for (let n = latest; n >= Math.max(0, latest - lookback); n--) {
     const b = await provider.getBlockWithTxs(n)
+    const blockTimestamp = Math.floor(Number((b as any).timestamp ?? nowSeconds))
+
+    if (blockTimestamp < fromTs) break
+    if (blockTimestamp > toTs) continue
+
     for (const tx of (b as any).transactions as any[]) {
       const to = (tx as any).calldata?.[0] || (tx as any).contract_address
       if (!to) continue
@@ -29,7 +37,9 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       const caller = (tx.sender_address || tx.sender || '0x0') as string
       const status: TxStatus = 'ACCEPTED'
       const fee = Number((tx.max_fee || 0))
-      rows.push({ timestamp: Math.floor(((b as any).timestamp as number) || Date.now()/1000), txHash: (tx as any).transaction_hash || (tx as any).hash, type, entrypoint, caller, to: p.address, fee, status, network: p.network })
+      const txTimestamp = Math.floor(Number((tx as any).timestamp ?? blockTimestamp))
+      if (txTimestamp < fromTs || txTimestamp > toTs) continue
+      rows.push({ timestamp: txTimestamp, txHash: (tx as any).transaction_hash || (tx as any).hash, type, entrypoint, caller, to: p.address, fee, status, network: p.network })
     }
   }
 
