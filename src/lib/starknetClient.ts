@@ -15,7 +15,7 @@ const RPCS: Record<Network, string> = {
 }
 
 export interface FetchParams {
-  address: string; network: Network; from: number; to: number; page: number; pageSize: number;
+  address: string; network: Network; from?: number; to?: number; page: number; pageSize: number;
   filters: Partial<{ type: TxType | 'ALL'; method: string; status: TxStatus | 'ALL'; minFee: number; maxFee: number }>
 }
 export interface FetchResult { rows: TxRow[]; totalEstimated?: number; hasMore?: boolean }
