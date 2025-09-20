@@ -65,6 +65,67 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     return timestamp
   }
 
+  const latestBlock = await provider.getBlockWithTxHashes('latest' as any)
+  const latestBlockNumber = Number((latestBlock as any).block_number ?? 0)
+  const latestTimestamp = Number((latestBlock as any).timestamp ?? Math.floor(Date.now() / 1000))
+  blockTimestampCache.set(latestBlockNumber, latestTimestamp)
+  const earliestTimestamp = await getBlockTimestamp(0)
+
+  const findBoundaryBlock = async (
+    targetTimestamp: number | undefined,
+    type: 'from' | 'to'
+  ): Promise<number | undefined> => {
+    if (targetTimestamp == null) {
+      return type === 'from' ? 0 : latestBlockNumber
+    }
+
+    if (type === 'from') {
+      if (targetTimestamp > latestTimestamp) return undefined
+      if (targetTimestamp <= earliestTimestamp) return 0
+    } else {
+      if (targetTimestamp < earliestTimestamp) return undefined
+      if (targetTimestamp >= latestTimestamp) return latestBlockNumber
+    }
+
+    let low = 0
+    let high = latestBlockNumber
+    let result = type === 'from' ? latestBlockNumber : 0
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2)
+      const timestamp = await getBlockTimestamp(mid)
+
+      if (type === 'from') {
+        if (timestamp >= targetTimestamp) {
+          result = mid
+          high = mid - 1
+        } else {
+          low = mid + 1
+        }
+      } else {
+        if (timestamp <= targetTimestamp) {
+          result = mid
+          low = mid + 1
+        } else {
+          high = mid - 1
+        }
+      }
+    }
+
+    return result
+  }
+
+  const fromBlock = await findBoundaryBlock(p.from, 'from')
+  const toBlock = await findBoundaryBlock(p.to, 'to')
+
+  if ((p.from != null && fromBlock == null) || (p.to != null && toBlock == null)) {
+    return { rows: [], totalEstimated: 0 }
+  }
+
+  if (fromBlock != null && toBlock != null && fromBlock > toBlock) {
+    return { rows: [], totalEstimated: 0 }
+  }
+
   let continuation: string | undefined
   const chunkSize = Math.max(100, p.pageSize)
 
@@ -72,7 +133,9 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     const { events, continuation_token } = await provider.getEvents({
       address: p.address,
       chunk_size: chunkSize,
-      continuation_token: continuation
+      continuation_token: continuation,
+      ...(fromBlock != null ? { from_block: { block_number: fromBlock } } : {}),
+      ...(toBlock != null ? { to_block: { block_number: toBlock } } : {})
     })
 
     continuation = continuation_token
@@ -128,13 +191,19 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     }
   } while (rows.length < continuationTarget && continuation)
 
-  rows.sort((a, b) => b.timestamp - a.timestamp)
+  const filteredRows = rows.filter((row) => {
+    if (p.from != null && row.timestamp < p.from) return false
+    if (p.to != null && row.timestamp > p.to) return false
+    return true
+  })
+
+  filteredRows.sort((a, b) => b.timestamp - a.timestamp)
 
   const start = (p.page - 1) * p.pageSize
-  const paged = rows.slice(start, start + p.pageSize)
+  const paged = filteredRows.slice(start, start + p.pageSize)
 
   return {
     rows: paged,
-    totalEstimated: rows.length
+    totalEstimated: filteredRows.length
   }
 }
