@@ -133,6 +133,78 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const limit = p.page * p.pageSize
   let nextContinuationToken: string | undefined
 
+  const addRow = (row: TxRow): boolean => {
+    if (seenTx.has(row.txHash)) return false
+    seenTx.add(row.txHash)
+    allRows.push(row)
+
+    const matches = matchesFilters(row)
+      && (p.from == null || row.timestamp >= p.from)
+      && (p.to == null || row.timestamp <= p.to)
+
+    if (matches) {
+      matchingRowCount += 1
+      if (limit > 0 && matchingRowCount >= limit) {
+        reachedLimit = true
+      }
+    }
+
+    return true
+  }
+
+  const findInvocationForAddress = (invocation: any): any | undefined => {
+    if (!invocation || typeof invocation !== 'object') return undefined
+
+    const contractAddress = String(invocation.contract_address || '').toLowerCase()
+    if (contractAddress === addressLower) return invocation
+
+    if (Array.isArray(invocation.calls)) {
+      for (const nested of invocation.calls) {
+        const found = findInvocationForAddress(nested)
+        if (found) return found
+      }
+    }
+
+    return undefined
+  }
+
+  const extractInvocationFromTrace = (trace: any): any | undefined => {
+    if (!trace || typeof trace !== 'object') return undefined
+
+    const tryInvocation = (candidate: any): any | undefined => {
+      return findInvocationForAddress(candidate)
+    }
+
+    const invokeTrace = trace.invoke_tx_trace
+    if (invokeTrace && typeof invokeTrace === 'object') {
+      const execution = invokeTrace.execute_invocation
+      if (execution && typeof execution === 'object' && 'contract_address' in execution) {
+        const found = tryInvocation(execution)
+        if (found) return found
+      }
+    }
+
+    const deployTrace = trace.deploy_account_tx_trace
+    if (deployTrace && typeof deployTrace === 'object') {
+      const found = tryInvocation(deployTrace.constructor_invocation)
+      if (found) return found
+    }
+
+    const l1HandlerTrace = trace.l1_handler_tx_trace
+    if (l1HandlerTrace && typeof l1HandlerTrace === 'object') {
+      const found = tryInvocation(l1HandlerTrace.function_invocation)
+      if (found) return found
+    }
+
+    const declareTrace = trace.declare_tx_trace
+    if (declareTrace && typeof declareTrace === 'object') {
+      const found = tryInvocation(declareTrace.validate_invocation)
+      if (found) return found
+    }
+
+    return undefined
+  }
+
   do {
     const { events, continuation_token } = await provider.getEvents({
       address: p.address,
@@ -148,7 +220,6 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     for (const event of events) {
       const txHash = (event as any).transaction_hash as string | undefined
       if (!txHash || seenTx.has(txHash)) continue
-      seenTx.add(txHash)
 
       try {
         const receipt = await provider.getTransactionReceipt(txHash) as any
@@ -183,25 +254,95 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
           network: p.network
         }
 
-        allRows.push(row)
-
-        const matches = matchesFilters(row)
-          && (p.from == null || row.timestamp >= p.from)
-          && (p.to == null || row.timestamp <= p.to)
-
-        if (matches) {
-          matchingRowCount += 1
-          if (limit > 0 && matchingRowCount >= limit) {
-            reachedLimit = true
-            continuation = undefined
-            break
-          }
+        const added = addRow(row)
+        if (added && reachedLimit) {
+          continuation = undefined
+          break
         }
       } catch {
         continue
       }
     }
   } while (continuation)
+
+  const blockRangeStart = fromBlock ?? 0
+  const blockRangeEnd = toBlock ?? latestBlockNumber
+  let txScanComplete = true
+
+  for (let blockNumber = blockRangeEnd; blockNumber >= blockRangeStart; blockNumber -= 1) {
+    if (reachedLimit) {
+      txScanComplete = false
+      break
+    }
+
+    let block: any
+
+    try {
+      block = await provider.getBlockWithTxs(blockNumber)
+    } catch {
+      continue
+    }
+
+    const blockTimestamp = Number((block as any)?.timestamp ?? Math.floor(Date.now() / 1000))
+    blockTimestampCache.set(blockNumber, blockTimestamp)
+
+    const transactions: any[] = Array.isArray((block as any)?.transactions) ? (block as any).transactions : []
+
+    for (const tx of transactions) {
+      if (reachedLimit) {
+        txScanComplete = false
+        break
+      }
+
+      const txHash = (tx as any)?.transaction_hash || (tx as any)?.hash
+      if (!txHash || seenTx.has(txHash)) continue
+
+      try {
+        const trace = await provider.getTransactionTrace(txHash)
+        const invocation = extractInvocationFromTrace(trace)
+        if (!invocation) continue
+
+        const contractAddress = String(invocation.contract_address || '').toLowerCase()
+        if (contractAddress !== addressLower) continue
+
+        const receipt = await provider.getTransactionReceipt(txHash) as any
+        if (!receipt) continue
+
+        const timestamp = await getBlockTimestamp(receipt.block_number ?? blockNumber)
+        const type = toTxType(receipt.type || (tx as any)?.type)
+        const status: TxStatus = (receipt.execution_status === 'REVERTED' || receipt.revert_reason) ? 'REJECTED' : 'ACCEPTED'
+        const fee = toFee(receipt.actual_fee?.amount)
+        const entrypoint = decodeSelector(
+          invocation.entry_point_selector_name
+            || invocation.entry_point_selector
+            || invocation.selector
+        )
+        const caller = (invocation.caller_address
+          || receipt.sender_address
+          || (tx as any)?.sender_address
+          || (tx as any)?.contract_address
+          || '0x0') as string
+
+        const row: TxRow = {
+          timestamp,
+          txHash,
+          type,
+          entrypoint,
+          caller,
+          to: invocation.contract_address || p.address,
+          fee,
+          status,
+          network: p.network
+        }
+
+        addRow(row)
+      } catch {
+        continue
+      }
+    }
+
+    if (!txScanComplete) break
+  }
 
   const filteredRows = allRows.filter((row) => {
     if (!matchesFilters(row)) return false
@@ -218,6 +359,10 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   return {
     rows: paged,
     totalEstimated: filteredRows.length,
-    hasMore: (start + p.pageSize < filteredRows.length) || reachedLimit || Boolean(nextContinuationToken)
+    hasMore:
+      (start + p.pageSize < filteredRows.length)
+      || reachedLimit
+      || Boolean(nextContinuationToken)
+      || !txScanComplete
   }
 }
