@@ -1,0 +1,5 @@
+import { fmtAddr, fmtNum, fmtTime } from '../lib/format'
+export default function TopCallers({ items }:{ items:{ rank:number; address:string; count:number; share:number; last:number }[]}){
+  const top10=items.slice(0,10)
+  return (<div className="space-y-3"><h3 className="text-sm font-semibold">Top callers</h3>{top10.map(it=>(<div key={it.address} className="grid grid-cols-12 items-center gap-2"><div className="col-span-1 text-sm text-slate-500">#{it.rank}</div><div className="col-span-6 flex items-center gap-2 min-w-0"><div className="w-6 h-6 bg-slate-300 rounded"></div><span className="font-mono truncate" title={it.address}>{fmtAddr(it.address)}</span></div><div className="col-span-2 text-right">{fmtNum(it.count)}</div><div className="col-span-3 text-right text-slate-500">{it.share.toFixed(1)}% · {fmtTime(it.last)}</div><div className="col-span-12 h-2 bg-slate-100 dark:bg-slate-800 rounded"><div className="h-2 bg-accent rounded" style={{width:`${it.share}%`}}/></div></div>))}</div>)
+}
