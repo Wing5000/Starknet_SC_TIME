@@ -128,6 +128,11 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   let continuation: string | undefined
   const chunkSize = Math.max(100, p.pageSize)
 
+  let matchingRowCount = 0
+  let reachedLimit = false
+  const limit = p.page * p.pageSize
+  let nextContinuationToken: string | undefined
+
   do {
     const { events, continuation_token } = await provider.getEvents({
       address: p.address,
@@ -137,7 +142,8 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       ...(toBlock != null ? { to_block: { block_number: toBlock } } : {})
     })
 
-    continuation = continuation_token
+    continuation = continuation_token ?? undefined
+    nextContinuationToken = continuation
 
     for (const event of events) {
       const txHash = (event as any).transaction_hash as string | undefined
@@ -178,6 +184,19 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
         }
 
         allRows.push(row)
+
+        const matches = matchesFilters(row)
+          && (p.from == null || row.timestamp >= p.from)
+          && (p.to == null || row.timestamp <= p.to)
+
+        if (matches) {
+          matchingRowCount += 1
+          if (limit > 0 && matchingRowCount >= limit) {
+            reachedLimit = true
+            continuation = undefined
+            break
+          }
+        }
       } catch {
         continue
       }
@@ -199,6 +218,6 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   return {
     rows: paged,
     totalEstimated: filteredRows.length,
-    hasMore: start + p.pageSize < filteredRows.length
+    hasMore: (start + p.pageSize < filteredRows.length) || reachedLimit || Boolean(nextContinuationToken)
   }
 }
