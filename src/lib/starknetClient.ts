@@ -15,8 +15,7 @@ export interface FetchResult { rows: TxRow[]; totalEstimated?: number }
 export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const provider = new RpcProvider({ nodeUrl: RPCS[p.network] })
   const rows: TxRow[] = []
-  const latestInfo = await provider.getBlockHashAndNumber()
-  const latest = latestInfo.block_number
+  const latest = await provider.getBlockNumber()
   const lookback = 400
 
   for (let n = latest; n >= Math.max(0, latest - lookback); n--) {
