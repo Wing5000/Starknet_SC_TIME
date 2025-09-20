@@ -23,7 +23,7 @@ const mockRow: FetchInteractionsReturn['rows'][number] = {
 }
 
 vi.mock('./lib/starknetClient', () => ({
-  fetchInteractions: vi.fn<Promise<FetchInteractionsReturn>, [FetchInteractionsParams]>()
+  fetchInteractions: vi.fn()
 }))
 
 const mockFetch = vi.mocked(fetchInteractions)
