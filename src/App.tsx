@@ -14,13 +14,13 @@ export default function App(){
   const [page,setPage]=useState(1); const pageSize=50
   const [rows,setRows]=useState<TxRow[]>([]); const [total,setTotal]=useState<number|undefined>(); const [loading,setLoading]=useState(false); const [error,setError]=useState<string|null>(null)
 
-  async function load(reset=false){
+  async function load(targetPage:number, reset=false){
     if(!filters.address) return
     setLoading(true); setError(null)
     try{
       const fromSec=Math.floor(new Date(filters.fromDate).getTime()/1000)
       const toSec=Math.floor(new Date(filters.toDate).getTime()/1000)+86399
-      const { rows:r, totalEstimated } = await fetchInteractions({ address:filters.address, network:filters.network, from:fromSec, to:toSec, page, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee } })
+      const { rows:r, totalEstimated } = await fetchInteractions({ address:filters.address, network:filters.network, from:fromSec, to:toSec, page:targetPage, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee } })
       setRows(prev=> reset? r : [...prev, ...r]); setTotal(totalEstimated)
     }catch(e:any){ setError(e?.message||'Load failed') } finally{ setLoading(false) }
   }
@@ -50,7 +50,7 @@ export default function App(){
           </select>
           <input type="number" inputMode="numeric" className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-900" placeholder="min fee" value={filters.minFee??''} onChange={e=>setFilters({...filters,minFee:e.target.value?Number(e.target.value):undefined})}/>
           <input type="number" inputMode="numeric" className="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-900" placeholder="max fee" value={filters.maxFee??''} onChange={e=>setFilters({...filters,maxFee:e.target.value?Number(e.target.value):undefined})}/>
-          <button onClick={()=>{ setPage(1); load(true) }} className="px-4 py-2 rounded-lg bg-accent text-white">Load data</button>
+          <button onClick={()=>{ setPage(1); load(1,true) }} className="px-4 py-2 rounded-lg bg-accent text-white">Load data</button>
         </div>
       </div>
     </div>
@@ -62,9 +62,9 @@ export default function App(){
         <MethodsHeatmap items={methods}/>
       </section>
       <section className="md:col-span-3 space-y-4">
-        {error && <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 flex items-center justify-between"><span>{error}</span><button onClick={()=>load()} className="px-3 py-1 rounded bg-red-100 dark:bg-red-800">Spróbuj ponownie</button></div>}
+        {error && <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 flex items-center justify-between"><span>{error}</span><button onClick={()=>load(page)} className="px-3 py-1 rounded bg-red-100 dark:bg-red-800">Spróbuj ponownie</button></div>}
         <div className="rounded-2xl border border-slate-200 dark:border-slate-800"><TxTable rows={rows}/></div>
-        {!loading && rows.length>0 && <div className="flex justify-center py-4"><button onClick={()=>{ const next=page+1; setPage(next); load(false) }} className="px-4 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700">Load more</button></div>}
+        {!loading && rows.length>0 && <div className="flex justify-center py-4"><button onClick={()=>{ const next=page+1; setPage(next); load(next) }} className="px-4 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700">Load more</button></div>}
         {loading && <div className="text-sm text-slate-500">Loading…</div>}
       </section>
     </main>
