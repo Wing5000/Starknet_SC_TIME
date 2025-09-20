@@ -261,7 +261,10 @@ describe('fetchInteractions rate limit handling', () => {
 
       expect(result.rows).toHaveLength(0)
       expect(getEvents).toHaveBeenCalledTimes(3)
-      expect(warnLogs.filter((entry) => entry.level === 'warn')).toHaveLength(2)
+      const rateLimitLogs = warnLogs.filter(
+        (entry) => entry.level === 'warn' && entry.message.includes('Rate limited')
+      )
+      expect(rateLimitLogs).toHaveLength(2)
     } finally {
       vi.useRealTimers()
     }
@@ -316,7 +319,10 @@ describe('fetchInteractions rate limit handling', () => {
 
       await expectation
       expect(getEvents.mock.calls.length).toBeGreaterThan(1)
-      expect(errorLogs.some((entry) => entry.level === 'error')).toBe(true)
+      const exhaustedLog = errorLogs.find(
+        (entry) => entry.level === 'error' && entry.message.includes('Retry budget exhausted')
+      )
+      expect(exhaustedLog).toBeTruthy()
     } finally {
       vi.useRealTimers()
     }
