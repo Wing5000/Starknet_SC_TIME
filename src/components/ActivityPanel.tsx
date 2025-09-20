@@ -19,15 +19,23 @@ export default function ActivityPanel({ open, logs, lastError, onClose }:Activit
         </div>
         <div className="max-h-96 overflow-y-auto px-5 py-4 space-y-3 text-sm">
           {logs.length===0 && <p className="text-slate-500">No activity yet.</p>}
-          {logs.map(entry=> (
-            <div key={entry.id} className="flex items-start gap-3">
-              <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${entry.level==='error'?'bg-red-500':'bg-emerald-500'}`}></span>
-              <div>
-                <p className="font-medium text-slate-900 dark:text-slate-100">{new Date(entry.timestamp).toLocaleTimeString()} – {entry.message}</p>
-                <p className="text-xs text-slate-500">{entry.level.toUpperCase()}</p>
+          {logs.map(entry=> {
+            const color = entry.level==='error'
+              ? 'bg-red-500'
+              : entry.level==='warn'
+                ? 'bg-amber-500'
+                : 'bg-emerald-500'
+
+            return (
+              <div key={entry.id} className="flex items-start gap-3">
+                <span className={`mt-0.5 h-2.5 w-2.5 rounded-full ${color}`}></span>
+                <div>
+                  <p className="font-medium text-slate-900 dark:text-slate-100">{new Date(entry.timestamp).toLocaleTimeString()} – {entry.message}</p>
+                  <p className="text-xs text-slate-500">{entry.level.toUpperCase()}</p>
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
         <div className="border-t border-slate-200 dark:border-slate-800 px-5 py-4 space-y-2">
           <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Last error</h3>

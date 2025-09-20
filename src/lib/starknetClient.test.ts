@@ -22,6 +22,14 @@ const createProviderImplementation = (options: {
   events?: { events: any[]; continuation_token?: string | null }
   receipts?: Record<string, any>
   traces?: Record<string, any>
+  overrides?: Partial<{
+    getBlockWithTxHashes: (identifier: any) => Promise<any>
+    getEvents: (...args: any[]) => Promise<any>
+    getTransactionReceipt: (txHash: string) => Promise<any>
+    getTransactionByHash: (...args: any[]) => Promise<any>
+    getBlockWithTxs: (blockNumber: number) => Promise<any>
+    getTransactionTrace: (txHash: string) => Promise<any>
+  }>
 }) => {
   const {
     latestBlock,
@@ -29,10 +37,11 @@ const createProviderImplementation = (options: {
     blockTransactions,
     events = { events: [], continuation_token: null },
     receipts = {},
-    traces = {}
+    traces = {},
+    overrides
   } = options
 
-  return {
+  const provider = {
     getBlockWithTxHashes: vi.fn(async (identifier: any) => {
       if (identifier === 'latest') {
         const timestamp = blockTimestamps.get(latestBlock) ?? Math.floor(Date.now() / 1000)
@@ -55,6 +64,8 @@ const createProviderImplementation = (options: {
     })),
     getTransactionTrace: vi.fn(async (txHash: string) => traces[txHash])
   }
+
+  return { ...provider, ...(overrides ?? {}) }
 }
 
 const ADDRESS = '0xCAFE'
@@ -184,5 +195,130 @@ describe('fetchInteractions fallback trace handling', () => {
     expect(result.rows).toHaveLength(0)
     expect(result.hasMore).toBe(true)
     expect(warnSpy).toHaveBeenCalled()
+  })
+})
+
+describe('fetchInteractions rate limit handling', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.resetModules()
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('retries RPC calls when a 429 response is received', async () => {
+    vi.stubEnv('VITE_MAX_TRACE_LOOKUPS', '10')
+    vi.useFakeTimers()
+
+    try {
+      const blockTimestamps = new Map<number, number>([
+        [0, 1000],
+        [1, 2000]
+      ])
+
+      const blockTransactions = new Map<number, any[]>([
+        [1, []],
+        [0, []]
+      ])
+
+      let attempts = 0
+      const warnLogs: any[] = []
+
+      const getEvents = vi.fn(async () => {
+        attempts += 1
+        if (attempts < 3) {
+          const error: any = new Error('429 rate limit')
+          error.response = { status: 429, headers: { 'retry-after': '0.05' } }
+          throw error
+        }
+        return { events: [], continuation_token: null }
+      })
+
+      mockProviderConfig.factory = () => createProviderImplementation({
+        latestBlock: 1,
+        blockTimestamps,
+        blockTransactions,
+        overrides: { getEvents }
+      })
+
+      const { fetchInteractions } = await import('./starknetClient')
+
+      const promise = fetchInteractions({
+        address: ADDRESS,
+        network: 'mainnet',
+        from: undefined,
+        to: undefined,
+        page: 1,
+        pageSize: 10,
+        filters: {},
+        log: (entry) => warnLogs.push(entry)
+      })
+
+      await vi.runAllTimersAsync()
+      const result = await promise
+
+      expect(result.rows).toHaveLength(0)
+      expect(getEvents).toHaveBeenCalledTimes(3)
+      expect(warnLogs.filter((entry) => entry.level === 'warn')).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bubbles up an error after exceeding retry attempts for 429 responses', async () => {
+    vi.stubEnv('VITE_MAX_TRACE_LOOKUPS', '10')
+    vi.useFakeTimers()
+
+    try {
+      const blockTimestamps = new Map<number, number>([
+        [0, 1000],
+        [1, 2000]
+      ])
+
+      const blockTransactions = new Map<number, any[]>([
+        [1, []],
+        [0, []]
+      ])
+
+      const getEvents = vi.fn(async () => {
+        const error: any = new Error('429 rate limit always')
+        error.response = { status: 429 }
+        throw error
+      })
+
+      const errorLogs: any[] = []
+
+      mockProviderConfig.factory = () => createProviderImplementation({
+        latestBlock: 1,
+        blockTimestamps,
+        blockTransactions,
+        overrides: { getEvents }
+      })
+
+      const { fetchInteractions } = await import('./starknetClient')
+
+      const promise = fetchInteractions({
+        address: ADDRESS,
+        network: 'mainnet',
+        from: undefined,
+        to: undefined,
+        page: 1,
+        pageSize: 10,
+        filters: {},
+        log: (entry) => errorLogs.push(entry)
+      })
+
+      const expectation = expect(promise).rejects.toThrow(/429/)
+
+      await vi.runAllTimersAsync()
+
+      await expectation
+      expect(getEvents.mock.calls.length).toBeGreaterThan(1)
+      expect(errorLogs.some((entry) => entry.level === 'error')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
