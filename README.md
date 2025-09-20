@@ -10,3 +10,5 @@ VITE_DATA_MODE=live pnpm dev
 Opcjonalne env:
 - `VITE_STARKNET_RPC_MAINNET`
 - `VITE_STARKNET_RPC_SEPOLIA`
+
+Domyślne publiczne endpointy oraz własne adresy w zmiennych środowiskowych powinny wskazywać na Starknet JSON-RPC w wersji co najmniej `v0_8` (np. `/rpc/v0_8`).
