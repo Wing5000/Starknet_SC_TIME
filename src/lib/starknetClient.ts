@@ -10,12 +10,11 @@ export interface FetchParams {
   address: string; network: Network; from: number; to: number; page: number; pageSize: number;
   filters: Partial<{ type: TxType | 'ALL'; method: string; status: TxStatus | 'ALL'; minFee: number; maxFee: number }>
 }
-export interface FetchResult { rows: TxRow[]; totalEstimated?: number }
+export interface FetchResult { rows: TxRow[]; totalEstimated?: number; hasMore?: boolean }
 
 export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const provider = new RpcProvider({ nodeUrl: RPCS[p.network] })
-  const continuationTarget = p.page * p.pageSize
-  const rows: TxRow[] = []
+  const allRows: TxRow[] = []
   const seenTx = new Set<string>()
   const blockTimestampCache = new Map<number, number>()
   const addressLower = p.address.toLowerCase()
@@ -150,8 +149,6 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
         if (!receipt) continue
 
         const timestamp = await getBlockTimestamp(receipt.block_number ?? (event as any).block_number)
-        if (p.from != null && timestamp < p.from) continue
-        if (p.to != null && timestamp > p.to) continue
 
         const tx = await provider.getTransactionByHash(txHash) as any
         const eventForContract = Array.isArray(receipt.events)
@@ -180,18 +177,15 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
           network: p.network
         }
 
-        if (matchesFilters(row)) {
-          rows.push(row)
-        }
+        allRows.push(row)
       } catch {
         continue
       }
-
-      if (rows.length >= continuationTarget) break
     }
-  } while (rows.length < continuationTarget && continuation)
+  } while (continuation)
 
-  const filteredRows = rows.filter((row) => {
+  const filteredRows = allRows.filter((row) => {
+    if (!matchesFilters(row)) return false
     if (p.from != null && row.timestamp < p.from) return false
     if (p.to != null && row.timestamp > p.to) return false
     return true
@@ -204,6 +198,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
 
   return {
     rows: paged,
-    totalEstimated: filteredRows.length
+    totalEstimated: filteredRows.length,
+    hasMore: start + p.pageSize < filteredRows.length
   }
 }
