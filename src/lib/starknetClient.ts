@@ -1,7 +1,89 @@
 import { RpcProvider, shortString } from 'starknet'
-import { TxRow, Network, TxStatus, TxType } from '../types'
+import { TxRow, Network, TxStatus, TxType, ActivityLogLevel } from '../types'
 
 const DEFAULT_MAX_TRACE_LOOKUPS = 200
+const MAX_RPC_RETRIES = 4
+const BASE_RETRY_DELAY_MS = 500
+const MAX_RETRY_DELAY_MS = 10_000
+
+type RetryLogEntry = { level: ActivityLogLevel; message: string }
+type RetryLogger = (entry: RetryLogEntry) => void
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+const parseRetryAfterHeader = (value: unknown): number | undefined => {
+  if (value == null) return undefined
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, value) * 1000
+  }
+
+  const stringValue = Array.isArray(value) ? String(value[0]) : String(value)
+  if (!stringValue) return undefined
+
+  const seconds = Number(stringValue)
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds) * 1000
+  }
+
+  const asDate = Date.parse(stringValue)
+  if (!Number.isNaN(asDate)) {
+    const diff = asDate - Date.now()
+    return diff > 0 ? diff : 0
+  }
+
+  return undefined
+}
+
+const getRetryDelayMs = (error: unknown, attempt: number): number => {
+  const headers = (error as any)?.response?.headers ?? {}
+  const retryAfterHeader = headers['retry-after'] ?? headers['Retry-After']
+  const retryAfterMs = parseRetryAfterHeader(retryAfterHeader)
+  if (retryAfterMs != null) return retryAfterMs
+  const exponential = BASE_RETRY_DELAY_MS * 2 ** (attempt - 1)
+  return Math.min(exponential, MAX_RETRY_DELAY_MS)
+}
+
+const isRateLimitError = (error: unknown): boolean => {
+  if (!error || typeof error !== 'object') return false
+  const status = (error as any)?.response?.status ?? (error as any)?.status
+  if (status === 429) return true
+  const code = (error as any)?.code
+  if (code === 429 || Number(code) === 429) return true
+  const message = String((error as any)?.message ?? '')
+  return message.includes('429') || message.toLowerCase().includes('rate limit')
+}
+
+interface RetryOptions {
+  method: string
+  maxAttempts?: number
+  log?: RetryLogger
+}
+
+async function callRpcWithRetry<T>(factory: () => Promise<T>, options: RetryOptions): Promise<T> {
+  const { method, maxAttempts = MAX_RPC_RETRIES, log } = options
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await factory()
+    } catch (error) {
+      if (!isRateLimitError(error)) {
+        throw error
+      }
+
+      if (attempt >= maxAttempts) {
+        log?.({ level: 'error', message: `[${method}] Rate limit exceeded after ${attempt} attempts.` })
+        throw error
+      }
+
+      const delayMs = getRetryDelayMs(error, attempt)
+      const delaySeconds = delayMs >= 1000 ? `${(delayMs / 1000).toFixed(1)}s` : `${delayMs}ms`
+      log?.({ level: 'warn', message: `[${method}] Rate limited (attempt ${attempt}). Retrying in ${delaySeconds}.` })
+      await sleep(delayMs)
+    }
+  }
+
+  throw new Error(`[${method}] RPC retry exhausted`)
+}
 const configuredLookupLimit = Number(
   (import.meta as any)?.env?.VITE_MAX_TRACE_LOOKUPS ?? DEFAULT_MAX_TRACE_LOOKUPS
 )
@@ -17,6 +99,7 @@ const RPCS: Record<Network, string> = {
 export interface FetchParams {
   address: string; network: Network; from?: number; to?: number; page: number; pageSize: number;
   filters: Partial<{ type: TxType | 'ALL'; method: string; status: TxStatus | 'ALL'; minFee: number; maxFee: number }>
+  log?: RetryLogger
 }
 export interface FetchResult { rows: TxRow[]; totalEstimated?: number; hasMore?: boolean }
 
@@ -26,6 +109,9 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const seenTx = new Set<string>()
   const blockTimestampCache = new Map<number, number>()
   const addressLower = p.address.toLowerCase()
+  const noopLog: RetryLogger = () => {}
+  const log = p.log ?? noopLog
+  const callWithRetry = <T>(factory: () => Promise<T>, method: string) => callRpcWithRetry(factory, { method, log })
 
   const decodeSelector = (value?: string): string | undefined => {
     if (!value) return undefined
@@ -66,13 +152,13 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const getBlockTimestamp = async (blockNumber?: number): Promise<number> => {
     if (blockNumber == null) return Math.floor(Date.now() / 1000)
     if (blockTimestampCache.has(blockNumber)) return blockTimestampCache.get(blockNumber)!
-    const block = await provider.getBlockWithTxHashes(blockNumber)
+    const block = await callWithRetry(() => provider.getBlockWithTxHashes(blockNumber), 'getBlockWithTxHashes')
     const timestamp = Number((block as any).timestamp ?? Math.floor(Date.now() / 1000))
     blockTimestampCache.set(blockNumber, timestamp)
     return timestamp
   }
 
-  const latestBlock = await provider.getBlockWithTxHashes('latest' as any)
+  const latestBlock = await callWithRetry(() => provider.getBlockWithTxHashes('latest' as any), 'getBlockWithTxHashes')
   const latestBlockNumber = Number((latestBlock as any).block_number ?? 0)
   const latestTimestamp = Number((latestBlock as any).timestamp ?? Math.floor(Date.now() / 1000))
   blockTimestampCache.set(latestBlockNumber, latestTimestamp)
@@ -214,13 +300,13 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   }
 
   do {
-    const { events, continuation_token } = await provider.getEvents({
+    const { events, continuation_token } = await callWithRetry(() => provider.getEvents({
       address: p.address,
       chunk_size: chunkSize,
       continuation_token: continuation,
       ...(fromBlock != null ? { from_block: { block_number: fromBlock } } : {}),
       ...(toBlock != null ? { to_block: { block_number: toBlock } } : {})
-    })
+    }), 'getEvents')
 
     continuation = continuation_token ?? undefined
     nextContinuationToken = continuation
@@ -230,12 +316,12 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       if (!txHash || seenTx.has(txHash)) continue
 
       try {
-        const receipt = await provider.getTransactionReceipt(txHash) as any
+        const receipt = await callWithRetry(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
         if (!receipt) continue
 
         const timestamp = await getBlockTimestamp(receipt.block_number ?? (event as any).block_number)
 
-        const tx = await provider.getTransactionByHash(txHash) as any
+        const tx = await callWithRetry(() => provider.getTransactionByHash(txHash), 'getTransactionByHash') as any
         const eventForContract = Array.isArray(receipt.events)
           ? receipt.events.find((e: any) => String(e.from_address || '').toLowerCase() === addressLower)
           : undefined
@@ -294,7 +380,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     let block: any
 
     try {
-      block = await provider.getBlockWithTxs(blockNumber)
+      block = await callWithRetry(() => provider.getBlockWithTxs(blockNumber), 'getBlockWithTxs')
       remainingTraceLookups -= 1
     } catch {
       continue
@@ -329,7 +415,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       if (!txHash) continue
 
       try {
-        const trace = await provider.getTransactionTrace(txHash)
+        const trace = await callWithRetry(() => provider.getTransactionTrace(txHash), 'getTransactionTrace')
         remainingTraceLookups -= 1
         const invocation = extractInvocationFromTrace(trace)
         if (!invocation) continue
@@ -337,7 +423,7 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
         const contractAddress = String(invocation.contract_address || '').toLowerCase()
         if (contractAddress !== addressLower) continue
 
-        const receipt = await provider.getTransactionReceipt(txHash) as any
+        const receipt = await callWithRetry(() => provider.getTransactionReceipt(txHash), 'getTransactionReceipt') as any
         if (!receipt) continue
 
         const timestamp = await getBlockTimestamp(receipt.block_number ?? blockNumber)

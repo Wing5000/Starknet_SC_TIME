@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Filters, Network, TxRow, ActivityLogEntry } from './types'
+import { Filters, Network, TxRow, ActivityLogEntry, ActivityLogLevel } from './types'
 import { fetchInteractions } from './lib/starknetClient'
 import { kpis, methodCounts, topCallers } from './lib/aggregations'
 import KpiCards from './components/KpiCards'
@@ -21,6 +21,9 @@ export default function App(){
   const appendLog=(entry:Omit<ActivityLogEntry,'id'>)=>{
     setLogs(prev=>[...prev,{...entry,id:`${entry.timestamp}-${Math.random().toString(36).slice(2,8)}` }])
   }
+  const logWithTimestamp=(entry:{ level:ActivityLogLevel; message:string })=>{
+    appendLog({ ...entry, timestamp:Date.now() })
+  }
 
   async function load(targetPage:number, reset=false){
     if(!filters.address) return
@@ -30,7 +33,7 @@ export default function App(){
     try{
       const fromSec=Math.floor(new Date(filters.fromDate).getTime()/1000)
       const toSec=Math.floor(new Date(filters.toDate).getTime()/1000)+86399
-      const { rows:r, totalEstimated } = await fetchInteractions({ address:filters.address, network:filters.network, from:fromSec, to:toSec, page:targetPage, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee } })
+      const { rows:r, totalEstimated } = await fetchInteractions({ address:filters.address, network:filters.network, from:fromSec, to:toSec, page:targetPage, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee }, log:logWithTimestamp })
       setRows(prev=> reset? r : [...prev, ...r]); setTotal(totalEstimated)
       appendLog({ level:'info', message:`Sukces: pobrano ${r.length} rekordów.`, timestamp:Date.now() })
       setLastError(null)
