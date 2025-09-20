@@ -7,7 +7,7 @@ import TxTable from './components/TxTable'
 import TopCallers from './components/TopCallers'
 import MethodsHeatmap from './components/MethodsHeatmap'
 
-const last7=()=>{ const to=new Date(), from=new Date(Date.now()-7*24*3600*1000); return {from:from.toISOString().slice(0,10), to:to.toISOString().slice(0,10)} }
+const last7=()=>{ const to=new Date(), from=new Date(Date.now()-7*24*3600*1000); return {fromDate:from.toISOString().slice(0,10), toDate:to.toISOString().slice(0,10)} }
 
 export default function App(){
   const [filters,setFilters]=useState<Filters>({ address:'', network:'mainnet', ...last7(), type:'ALL', status:'ALL' })
