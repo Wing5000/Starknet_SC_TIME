@@ -2,11 +2,11 @@ import { RpcProvider, shortString } from 'starknet'
 import { TxRow, Network, TxStatus, TxType, ActivityLogLevel } from '../types'
 
 const DEFAULT_MAX_TRACE_LOOKUPS = 200
-const MAX_RPC_RETRIES = 4
 const BASE_RETRY_DELAY_MS = 500
 const MAX_RETRY_DELAY_MS = 10_000
 const DEFAULT_RPC_REQUESTS_PER_SECOND = 3
 const DEFAULT_RPC_MAX_CONCURRENCY = 2
+const DEFAULT_RPC_RETRY_TIMEOUT_MS = 60_000
 
 type RetryLogEntry = { level: ActivityLogLevel; message: string }
 type RetryLogger = (entry: RetryLogEntry) => void
@@ -219,11 +219,22 @@ const isRateLimitError = (error: unknown): boolean => {
 interface RetryOptions {
   method: string
   maxAttempts?: number
+  maxDurationMs?: number
   log?: RetryLogger
 }
 
+const formatDuration = (ms: number): string => {
+  if (ms >= 1000) {
+    const seconds = ms / 1000
+    return seconds >= 60 ? `${(seconds / 60).toFixed(1)}m` : `${seconds.toFixed(1)}s`
+  }
+  return `${Math.round(ms)}ms`
+}
+
 async function callRpcWithRetry<T>(factory: () => Promise<T>, options: RetryOptions): Promise<T> {
-  const { method, maxAttempts = MAX_RPC_RETRIES, log } = options
+  const { method, log, maxDurationMs = RPC_RETRY_TIMEOUT_MS } = options
+  const maxAttempts = options.maxAttempts ?? Number.POSITIVE_INFINITY
+  const startTime = Date.now()
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -233,14 +244,43 @@ async function callRpcWithRetry<T>(factory: () => Promise<T>, options: RetryOpti
         throw error
       }
 
-      if (attempt >= maxAttempts) {
-        log?.({ level: 'error', message: `[${method}] Rate limit exceeded after ${attempt} attempts.` })
+      const elapsedMs = Date.now() - startTime
+      if (elapsedMs >= maxDurationMs) {
+        log?.({
+          level: 'error',
+          message: `[${method}] Retry budget exhausted after ${formatDuration(elapsedMs)} (limit ${formatDuration(
+            maxDurationMs
+          )}). Increase VITE_RPC_RETRY_TIMEOUT_MS or use an endpoint that supports longer retry-after.`
+        })
         throw error
       }
 
       const delayMs = getRetryDelayMs(error, attempt)
-      const delaySeconds = delayMs >= 1000 ? `${(delayMs / 1000).toFixed(1)}s` : `${delayMs}ms`
-      log?.({ level: 'warn', message: `[${method}] Rate limited (attempt ${attempt}). Retrying in ${delaySeconds}.` })
+      const projectedElapsed = elapsedMs + delayMs
+
+      if (attempt + 1 > maxAttempts) {
+        log?.({
+          level: 'error',
+          message: `[${method}] Retry attempt limit (${maxAttempts}) reached after ${formatDuration(elapsedMs)}.`
+        })
+        throw error
+      }
+
+      if (projectedElapsed > maxDurationMs) {
+        log?.({
+          level: 'error',
+          message: `[${method}] Retry budget exhausted after ${formatDuration(elapsedMs)} (next retry would take us over ${formatDuration(
+            maxDurationMs
+          )}). Increase VITE_RPC_RETRY_TIMEOUT_MS or use an endpoint that supports longer retry-after.`
+        })
+        throw error
+      }
+
+      const delayLabel = delayMs >= 1000 ? `${(delayMs / 1000).toFixed(1)}s` : `${delayMs}ms`
+      log?.({
+        level: 'warn',
+        message: `[${method}] Rate limited (attempt ${attempt}). Retrying in ${delayLabel}.`
+      })
       await sleep(delayMs)
     }
   }
@@ -267,6 +307,11 @@ export const RPC_REQUESTS_PER_SECOND = parsePositiveNumber(
 export const RPC_MAX_CONCURRENCY = Math.max(
   1,
   Math.floor(parsePositiveNumber(env?.VITE_RPC_MAX_CONCURRENCY, DEFAULT_RPC_MAX_CONCURRENCY, 1))
+)
+
+export const RPC_RETRY_TIMEOUT_MS = Math.max(
+  1000,
+  Math.floor(parsePositiveNumber(env?.VITE_RPC_RETRY_TIMEOUT_MS, DEFAULT_RPC_RETRY_TIMEOUT_MS, 1000))
 )
 
 const rpcRateLimiter = new RpcRateLimiter({
