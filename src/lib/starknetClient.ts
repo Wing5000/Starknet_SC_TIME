@@ -1,6 +1,14 @@
 import { RpcProvider, shortString } from 'starknet'
 import { TxRow, Network, TxStatus, TxType } from '../types'
 
+const DEFAULT_MAX_TRACE_LOOKUPS = 200
+const configuredLookupLimit = Number(
+  (import.meta as any)?.env?.VITE_MAX_TRACE_LOOKUPS ?? DEFAULT_MAX_TRACE_LOOKUPS
+)
+export const MAX_TRACE_LOOKUPS = Number.isFinite(configuredLookupLimit) && configuredLookupLimit > 0
+  ? configuredLookupLimit
+  : DEFAULT_MAX_TRACE_LOOKUPS
+
 const RPCS: Record<Network, string> = {
   mainnet: import.meta.env.VITE_STARKNET_RPC_MAINNET || 'https://starknet-mainnet.public.blastapi.io/rpc/v0_8',
   sepolia: import.meta.env.VITE_STARKNET_RPC_SEPOLIA || 'https://starknet-sepolia.public.blastapi.io/rpc/v0_8'
@@ -268,6 +276,8 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
   const blockRangeStart = fromBlock ?? 0
   const blockRangeEnd = toBlock ?? latestBlockNumber
   let txScanComplete = true
+  let fallbackBudgetExhausted = false
+  let remainingTraceLookups = MAX_TRACE_LOOKUPS
 
   for (let blockNumber = blockRangeEnd; blockNumber >= blockRangeStart; blockNumber -= 1) {
     if (reachedLimit) {
@@ -275,10 +285,17 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       break
     }
 
+    if (remainingTraceLookups <= 0) {
+      txScanComplete = false
+      fallbackBudgetExhausted = true
+      break
+    }
+
     let block: any
 
     try {
       block = await provider.getBlockWithTxs(blockNumber)
+      remainingTraceLookups -= 1
     } catch {
       continue
     }
@@ -287,18 +304,33 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
     blockTimestampCache.set(blockNumber, blockTimestamp)
 
     const transactions: any[] = Array.isArray((block as any)?.transactions) ? (block as any).transactions : []
+    const unseenTransactions = transactions.filter((tx: any) => {
+      const hash = (tx as any)?.transaction_hash || (tx as any)?.hash
+      return Boolean(hash) && !seenTx.has(hash)
+    })
 
-    for (const tx of transactions) {
+    if (unseenTransactions.length === 0) {
+      continue
+    }
+
+    for (const tx of unseenTransactions) {
       if (reachedLimit) {
         txScanComplete = false
         break
       }
 
+      if (remainingTraceLookups <= 0) {
+        txScanComplete = false
+        fallbackBudgetExhausted = true
+        break
+      }
+
       const txHash = (tx as any)?.transaction_hash || (tx as any)?.hash
-      if (!txHash || seenTx.has(txHash)) continue
+      if (!txHash) continue
 
       try {
         const trace = await provider.getTransactionTrace(txHash)
+        remainingTraceLookups -= 1
         const invocation = extractInvocationFromTrace(trace)
         if (!invocation) continue
 
@@ -341,7 +373,11 @@ export async function fetchInteractions(p: FetchParams): Promise<FetchResult> {
       }
     }
 
-    if (!txScanComplete) break
+    if (!txScanComplete || fallbackBudgetExhausted) break
+  }
+
+  if (fallbackBudgetExhausted) {
+    console.warn('[starknetClient] Trace lookup budget exhausted during fallback scan')
   }
 
   const filteredRows = allRows.filter((row) => {
