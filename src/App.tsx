@@ -10,6 +10,14 @@ import ActivityPanel from './components/ActivityPanel'
 
 const last7=()=>{ const to=new Date(), from=new Date(Date.now()-7*24*3600*1000); return {fromDate:from.toISOString().slice(0,10), toDate:to.toISOString().slice(0,10)} }
 
+const parseDateToSeconds=(value?:string,{ endOfDay=false }={})=>{
+  if(!value) return undefined
+  const parsed=Date.parse(value)
+  if(Number.isNaN(parsed)) return undefined
+  const seconds=Math.floor(parsed/1000)
+  return endOfDay?seconds+86399:seconds
+}
+
 export default function App(){
   const [filters,setFilters]=useState<Filters>({ address:'', network:'mainnet', ...last7(), type:'ALL', status:'ALL' })
   const [page,setPage]=useState(1); const pageSize=50
@@ -31,9 +39,12 @@ export default function App(){
     const startMessage=reset?'Start: rozpoczynam odświeżone ładowanie danych.':`Start: pobieram stronę ${targetPage}.`
     appendLog({ level:'info', message:startMessage, timestamp:Date.now() })
     try{
-      const fromSec=Math.floor(new Date(filters.fromDate).getTime()/1000)
-      const toSec=Math.floor(new Date(filters.toDate).getTime()/1000)+86399
-      const { rows:r, totalEstimated } = await fetchInteractions({ address:filters.address, network:filters.network, from:fromSec, to:toSec, page:targetPage, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee }, log:logWithTimestamp })
+      const fromSec=parseDateToSeconds(filters.fromDate)
+      const toSec=parseDateToSeconds(filters.toDate,{ endOfDay:true })
+      const params:Parameters<typeof fetchInteractions>[0]={ address:filters.address, network:filters.network, page:targetPage, pageSize, filters:{ type:filters.type==='ALL'?undefined:filters.type, method:filters.method||undefined, status:filters.status==='ALL'?undefined:filters.status, minFee:filters.minFee, maxFee:filters.maxFee }, log:logWithTimestamp }
+      if(fromSec!==undefined) params.from=fromSec
+      if(toSec!==undefined) params.to=toSec
+      const { rows:r, totalEstimated } = await fetchInteractions(params)
       setRows(prev=> reset? r : [...prev, ...r]); setTotal(totalEstimated)
       appendLog({ level:'info', message:`Sukces: pobrano ${r.length} rekordów.`, timestamp:Date.now() })
       setLastError(null)

@@ -261,7 +261,10 @@ describe('fetchInteractions rate limit handling', () => {
 
       expect(result.rows).toHaveLength(0)
       expect(getEvents).toHaveBeenCalledTimes(3)
-      expect(warnLogs.filter((entry) => entry.level === 'warn')).toHaveLength(2)
+      const retryWarns = warnLogs.filter(
+        (entry) => entry.level === 'warn' && entry.message.startsWith('[getEvents]')
+      )
+      expect(retryWarns).toHaveLength(2)
     } finally {
       vi.useRealTimers()
     }
