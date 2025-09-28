@@ -5,6 +5,9 @@ const DEFAULT_MAX_TRACE_LOOKUPS = 200
 const MAX_RPC_RETRIES = 4
 const BASE_RETRY_DELAY_MS = 500
 const MAX_RETRY_DELAY_MS = 10_000
+const MAX_TOTAL_RETRY_DELAY_MS = 60_000
+const MIN_JITTER_FACTOR = 0.5
+const MAX_JITTER_FACTOR = 1.5
 const DEFAULT_RPC_REQUESTS_PER_SECOND = 3
 const DEFAULT_RPC_MAX_CONCURRENCY = 2
 
@@ -197,23 +200,54 @@ const parseRetryAfterHeader = (value: unknown): number | undefined => {
   return undefined
 }
 
-const getRetryDelayMs = (error: unknown, attempt: number): number => {
+const remainingRetryBudget = (elapsedDelayMs: number): number => {
+  return Math.max(0, MAX_TOTAL_RETRY_DELAY_MS - elapsedDelayMs)
+}
+
+const getRetryDelayMs = (error: unknown, attempt: number, elapsedDelayMs: number): number => {
   const headers = (error as any)?.response?.headers ?? {}
   const retryAfterHeader = headers['retry-after'] ?? headers['Retry-After']
   const retryAfterMs = parseRetryAfterHeader(retryAfterHeader)
-  if (retryAfterMs != null) return retryAfterMs
+  const budget = remainingRetryBudget(elapsedDelayMs)
+  if (budget <= 0) return 0
+  if (retryAfterMs != null) {
+    return Math.min(retryAfterMs, budget)
+  }
   const exponential = BASE_RETRY_DELAY_MS * 2 ** (attempt - 1)
-  return Math.min(exponential, MAX_RETRY_DELAY_MS)
+  const capped = Math.min(exponential, MAX_RETRY_DELAY_MS)
+  const jitterFactor = MIN_JITTER_FACTOR + Math.random() * (MAX_JITTER_FACTOR - MIN_JITTER_FACTOR)
+  const jittered = Math.round(capped * jitterFactor)
+  return Math.min(jittered, budget)
 }
 
-const isRateLimitError = (error: unknown): boolean => {
+const isRetryableError = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') return false
   const status = (error as any)?.response?.status ?? (error as any)?.status
   if (status === 429) return true
+  if (typeof status === 'number' && status >= 500 && status < 600) return true
   const code = (error as any)?.code
+  const normalizedCode = typeof code === 'string' ? code.toUpperCase() : undefined
   if (code === 429 || Number(code) === 429) return true
+  if (normalizedCode === 'ECONNRESET' || normalizedCode === 'ETIMEDOUT') return true
   const message = String((error as any)?.message ?? '')
-  return message.includes('429') || message.toLowerCase().includes('rate limit')
+  const lowerMessage = message.toLowerCase()
+  if (lowerMessage.includes('429') || lowerMessage.includes('rate limit')) return true
+  if (lowerMessage.includes('timeout')) return true
+  return false
+}
+
+const describeRetryableError = (error: unknown): string => {
+  if (!error || typeof error !== 'object') return 'unknown error'
+  const status = (error as any)?.response?.status ?? (error as any)?.status
+  if (typeof status === 'number') {
+    if (status === 429) return 'status 429'
+    if (status >= 500 && status < 600) return `status ${status}`
+  }
+  const code = (error as any)?.code
+  if (code != null) return `code ${code}`
+  const message = String((error as any)?.message ?? '')
+  if (message) return message
+  return 'unknown error'
 }
 
 interface RetryOptions {
@@ -225,22 +259,39 @@ interface RetryOptions {
 async function callRpcWithRetry<T>(factory: () => Promise<T>, options: RetryOptions): Promise<T> {
   const { method, maxAttempts = MAX_RPC_RETRIES, log } = options
 
+  let totalDelayMs = 0
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       return await factory()
     } catch (error) {
-      if (!isRateLimitError(error)) {
+      if (!isRetryableError(error)) {
         throw error
       }
 
       if (attempt >= maxAttempts) {
-        log?.({ level: 'error', message: `[${method}] Rate limit exceeded after ${attempt} attempts.` })
+        const reason = describeRetryableError(error)
+        log?.({
+          level: 'error',
+          message: `[${method}] Retry attempts exhausted after ${attempt} attempts (${reason}).`
+        })
         throw error
       }
 
-      const delayMs = getRetryDelayMs(error, attempt)
+      const reason = describeRetryableError(error)
+      const delayMs = getRetryDelayMs(error, attempt, totalDelayMs)
+      if (delayMs <= 0) {
+        log?.({
+          level: 'error',
+          message: `[${method}] Retry budget exhausted after ${attempt} attempts (${reason}).`
+        })
+        throw error
+      }
+      totalDelayMs += delayMs
       const delaySeconds = delayMs >= 1000 ? `${(delayMs / 1000).toFixed(1)}s` : `${delayMs}ms`
-      log?.({ level: 'warn', message: `[${method}] Rate limited (attempt ${attempt}). Retrying in ${delaySeconds}.` })
+      log?.({
+        level: 'warn',
+        message: `[${method}] Retryable error (${reason}) on attempt ${attempt}. Retrying in ${delaySeconds}.`
+      })
       await sleep(delayMs)
     }
   }

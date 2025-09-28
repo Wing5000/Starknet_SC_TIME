@@ -270,6 +270,132 @@ describe('fetchInteractions rate limit handling', () => {
     }
   })
 
+  it('retries RPC calls when a retryable non-429 error is received', async () => {
+    vi.stubEnv('VITE_MAX_TRACE_LOOKUPS', '10')
+    vi.useFakeTimers()
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const blockTimestamps = new Map<number, number>([
+        [0, 1000],
+        [1, 2000]
+      ])
+
+      const blockTransactions = new Map<number, any[]>([
+        [1, []],
+        [0, []]
+      ])
+
+      let attempts = 0
+      const warnLogs: any[] = []
+
+      const getEvents = vi.fn(async () => {
+        attempts += 1
+        if (attempts === 1) {
+          const error: any = new Error('temporary outage')
+          error.response = { status: 502 }
+          throw error
+        }
+        return { events: [], continuation_token: null }
+      })
+
+      mockProviderConfig.factory = () => createProviderImplementation({
+        latestBlock: 1,
+        blockTimestamps,
+        blockTransactions,
+        overrides: { getEvents }
+      })
+
+      const { fetchInteractions } = await import('./starknetClient')
+
+      const promise = fetchInteractions({
+        address: ADDRESS,
+        network: 'mainnet',
+        from: undefined,
+        to: undefined,
+        page: 1,
+        pageSize: 10,
+        filters: {},
+        log: (entry) => warnLogs.push(entry)
+      })
+
+      await vi.runAllTimersAsync()
+      const result = await promise
+
+      expect(result.rows).toHaveLength(0)
+      expect(getEvents).toHaveBeenCalledTimes(2)
+      const retryWarns = warnLogs.filter((entry) => entry.level === 'warn' && entry.message.startsWith('[getEvents]'))
+      expect(retryWarns).toHaveLength(1)
+      expect(retryWarns[0].message).toContain('status 502')
+    } finally {
+      randomSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries RPC calls when a temporary network error code is received', async () => {
+    vi.stubEnv('VITE_MAX_TRACE_LOOKUPS', '10')
+    vi.useFakeTimers()
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5)
+
+    try {
+      const blockTimestamps = new Map<number, number>([
+        [0, 1000],
+        [1, 2000]
+      ])
+
+      const blockTransactions = new Map<number, any[]>([
+        [1, []],
+        [0, []]
+      ])
+
+      let attempts = 0
+      const warnLogs: any[] = []
+
+      const getEvents = vi.fn(async () => {
+        attempts += 1
+        if (attempts === 1) {
+          const error: any = new Error('socket closed unexpectedly')
+          error.code = 'ECONNRESET'
+          throw error
+        }
+        return { events: [], continuation_token: null }
+      })
+
+      mockProviderConfig.factory = () => createProviderImplementation({
+        latestBlock: 1,
+        blockTimestamps,
+        blockTransactions,
+        overrides: { getEvents }
+      })
+
+      const { fetchInteractions } = await import('./starknetClient')
+
+      const promise = fetchInteractions({
+        address: ADDRESS,
+        network: 'mainnet',
+        from: undefined,
+        to: undefined,
+        page: 1,
+        pageSize: 10,
+        filters: {},
+        log: (entry) => warnLogs.push(entry)
+      })
+
+      await vi.runAllTimersAsync()
+      const result = await promise
+
+      expect(result.rows).toHaveLength(0)
+      expect(getEvents).toHaveBeenCalledTimes(2)
+      const retryWarns = warnLogs.filter((entry) => entry.level === 'warn' && entry.message.startsWith('[getEvents]'))
+      expect(retryWarns).toHaveLength(1)
+      expect(retryWarns[0].message).toContain('code ECONNRESET')
+    } finally {
+      randomSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it('bubbles up an error after exceeding retry attempts for 429 responses', async () => {
     vi.stubEnv('VITE_MAX_TRACE_LOOKUPS', '10')
     vi.useFakeTimers()
